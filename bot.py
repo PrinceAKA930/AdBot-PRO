@@ -1,279 +1,306 @@
 import os
+import json
 import asyncio
-import random
-import sqlite3
-from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telethon import TelegramClient
-from telethon.errors import (
-    AuthRestartError,
-    SendCodeUnavailableError,
-    PhoneCodeInvalidError
-)
 
-# =========================
+# =================================
 # ENV
-# =========================
-load_dotenv()
+# =================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS").split(",")))
-LOG_CHANNEL = os.getenv("LOG_CHANNEL")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-os.makedirs("sessions", exist_ok=True)
+# =================================
+# FILES
+# =================================
 
-# =========================
+DATA_FILE = "data.json"
+SESSIONS_DIR = "sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+
+# =================================
 # DATABASE
-# =========================
-db = sqlite3.connect("data.db")
-cur = db.cursor()
+# =================================
 
-cur.execute("CREATE TABLE IF NOT EXISTS chats(uid INT, chat TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS settings(uid INT, msg TEXT, interval INT)")
-db.commit()
-
-# =========================
-# MEMORY
-# =========================
-states = {}
-clients = {}
-tasks = {}
-
-# =========================
-# BUTTONS
-# =========================
-def panel():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔐 Login", callback_data="login"),
-         InlineKeyboardButton("👤 Accounts", callback_data="accounts")],
-
-        [InlineKeyboardButton("➕ Add Chat", callback_data="add"),
-         InlineKeyboardButton("➖ Remove Chat", callback_data="remove")],
-
-        [InlineKeyboardButton("✏ Message", callback_data="msg"),
-         InlineKeyboardButton("⏱ Interval", callback_data="interval")],
-
-        [InlineKeyboardButton("▶ Start Ads", callback_data="start"),
-         InlineKeyboardButton("⛔ Stop Ads", callback_data="stop")]
-    ])
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    return json.load(open(DATA_FILE))
 
 
-# =========================
+def save_data(d):
+    json.dump(d, open(DATA_FILE, "w"), indent=2)
+
+
+db = load_data()
+
+
+# =================================
+# KEYBOARD
+# =================================
+
+def keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["📱 Login", "🚪 Logout"],
+            ["➕ Add Chat", "➖ Remove Chat"],
+            ["📋 List Chats"],
+            ["📝 Set Message"],
+            ["▶ Start Ads", "⏹ Stop Ads"],
+            ["⏱ Interval", "📊 Status"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+# =================================
 # HELPERS
-# =========================
-def get_setting(uid):
-    row = cur.execute("SELECT msg, interval FROM settings WHERE uid=?", (uid,)).fetchone()
-    if not row:
-        return None, 60
-    return row[0], row[1]
+# =================================
+
+def get_user(uid):
+    uid = str(uid)
+
+    if uid not in db:
+        db[uid] = {
+            "chats": [],
+            "interval": 60,
+            "message": "🔥 Default Ad Message 🔥",
+            "running": False,
+            "state": None,
+            "phone": None,
+        }
+
+    return db[uid]
 
 
-def set_setting(uid, msg=None, interval=None):
-    m, i = get_setting(uid)
-    msg = msg or m
-    interval = interval or i
-
-    cur.execute("DELETE FROM settings WHERE uid=?", (uid,))
-    cur.execute("INSERT INTO settings VALUES(?,?,?)", (uid, msg, interval))
-    db.commit()
+async def get_client(uid):
+    return TelegramClient(f"{SESSIONS_DIR}/{uid}", API_ID, API_HASH)
 
 
-def get_chats(uid):
-    rows = cur.execute("SELECT chat FROM chats WHERE uid=?", (uid,)).fetchall()
-    return [r[0] for r in rows]
-
-
-# =========================
-# START
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 AdBot PRO++ Panel", reply_markup=panel())
-
-
-# =========================
-# BUTTONS
-# =========================
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    uid = q.from_user.id
-    if uid not in ADMIN_IDS:
-        return
-
-    data = q.data
-
-    if data == "login":
-        states[uid] = "phone"
-        await q.message.reply_text("Send phone with country code (+91...)")
-
-    elif data == "accounts":
-        if uid in clients:
-            me = await clients[uid].get_me()
-            await q.message.reply_text(f"Logged in: {me.first_name}")
-        else:
-            await q.message.reply_text("No account")
-
-    elif data == "add":
-        states[uid] = "add"
-        await q.message.reply_text("Send chat id or @username")
-
-    elif data == "remove":
-        states[uid] = "remove"
-        await q.message.reply_text("Send chat id to remove")
-
-    elif data == "msg":
-        states[uid] = "msg"
-        await q.message.reply_text("Send ad message")
-
-    elif data == "interval":
-        states[uid] = "interval"
-        await q.message.reply_text("Send seconds")
-
-    elif data == "start":
-        await start_ads(uid, q.message)
-
-    elif data == "stop":
-        await stop_ads(uid, q.message)
-
-
-# =========================
-# TEXT
-# =========================
-async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    msg = update.message.text
-
-    state = states.get(uid)
-
-    if uid not in ADMIN_IDS:
-        return
-
-    try:
-        # LOGIN PHONE
-        if state == "phone":
-            client = TelegramClient(f"sessions/{uid}", API_ID, API_HASH)
-            await client.connect()
-
-            clients[uid] = client
-            states[uid] = {"otp": msg}
-
-            await client.send_code_request(msg)
-            await update.message.reply_text("Enter OTP code")
-
-        # LOGIN OTP
-        elif isinstance(state, dict) and "otp" in state:
-            phone = state["otp"]
-            client = clients[uid]
-
-            await client.sign_in(phone, msg)
-
-            states[uid] = None
-            await update.message.reply_text("✅ Logged in successfully")
-
-        # ADD CHAT
-        elif state == "add":
-            cur.execute("INSERT INTO chats VALUES(?,?)", (uid, msg))
-            db.commit()
-            states[uid] = None
-            await update.message.reply_text("Chat added")
-
-        # REMOVE CHAT
-        elif state == "remove":
-            cur.execute("DELETE FROM chats WHERE uid=? AND chat=?", (uid, msg))
-            db.commit()
-            states[uid] = None
-            await update.message.reply_text("Chat removed")
-
-        # MESSAGE
-        elif state == "msg":
-            set_setting(uid, msg=msg)
-            states[uid] = None
-            await update.message.reply_text("Message saved")
-
-        # INTERVAL
-        elif state == "interval":
-            set_setting(uid, interval=int(msg))
-            states[uid] = None
-            await update.message.reply_text("Interval saved")
-
-        else:
-            await update.message.reply_text("Use buttons", reply_markup=panel())
-
-    except AuthRestartError:
-        await update.message.reply_text("⚠ OTP failed. Try again.")
-    except PhoneCodeInvalidError:
-        await update.message.reply_text("❌ Wrong OTP")
-    except SendCodeUnavailableError:
-        await update.message.reply_text("⚠ Too many attempts. Wait few minutes.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-
-# =========================
+# =================================
 # ADS LOOP
-# =========================
+# =================================
+
 async def ads_loop(uid):
-    while True:
+    user = get_user(uid)
+    client = await get_client(uid)
+
+    await client.connect()
+
+    while user["running"]:
         try:
-            msg, interval = get_setting(uid)
-            chats = get_chats(uid)
+            for chat in user["chats"]:
+                await client.send_message(chat, user["message"])
 
-            if not msg or not chats:
-                await asyncio.sleep(5)
-                continue
+            await asyncio.sleep(user["interval"])
 
-            for c in chats:
-                try:
-                    await clients[uid].send_message(c, msg)
-                except:
-                    pass
+        except:
+            await asyncio.sleep(5)
 
-            await asyncio.sleep(interval + random.randint(0, 5))
-
-        except asyncio.CancelledError:
-            break
+    await client.disconnect()
 
 
-async def start_ads(uid, message):
-    if uid not in clients:
-        await message.reply_text("Login first")
+# =================================
+# START
+# =================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 AdBot PRO++ Ready",
+        reply_markup=keyboard(),
+    )
+
+
+# =================================
+# MAIN TEXT HANDLER
+# =================================
+
+async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message.text.strip()
+    uid = update.message.from_user.id
+    user = get_user(uid)
+
+    # =========================
+    # LOGIN FLOW
+    # =========================
+
+    if msg == "📱 Login":
+        user["state"] = "phone"
+        save_data(db)
+        await update.message.reply_text("Send phone number (+91xxxx)")
         return
 
-    if uid in tasks:
-        await message.reply_text("Already running")
+    if user["state"] == "phone":
+        user["phone"] = msg
+
+        client = await get_client(uid)
+        await client.connect()
+        await client.send_code_request(msg)
+
+        user["state"] = "otp"
+        save_data(db)
+
+        await update.message.reply_text(
+            "Send OTP like:\ncode12345"
+        )
         return
 
-    tasks[uid] = asyncio.create_task(ads_loop(uid))
-    await message.reply_text("Ads started")
+    # ===== OTP FORMAT FIXED HERE =====
+
+    if user["state"] == "otp":
+        if not msg.startswith("code"):
+            await update.message.reply_text("Format must be: code12345")
+            return
+
+        code = msg[4:]
+
+        client = await get_client(uid)
+        await client.sign_in(user["phone"], code)
+
+        user["state"] = None
+        save_data(db)
+
+        await update.message.reply_text("✅ Login successful")
+        return
+
+    # =========================
+    # LOGOUT
+    # =========================
+
+    if msg == "🚪 Logout":
+        session = f"{SESSIONS_DIR}/{uid}.session"
+        if os.path.exists(session):
+            os.remove(session)
+
+        await update.message.reply_text("Logged out")
+        return
+
+    # =========================
+    # SET MESSAGE (NEW FEATURE)
+    # =========================
+
+    if msg == "📝 Set Message":
+        user["state"] = "set_message"
+        await update.message.reply_text("Send your ad message text")
+        return
+
+    if user["state"] == "set_message":
+        user["message"] = msg
+        user["state"] = None
+        save_data(db)
+        await update.message.reply_text("✅ Message updated")
+        return
+
+    # =========================
+    # CHAT MANAGEMENT
+    # =========================
+
+    if msg == "➕ Add Chat":
+        user["state"] = "add_chat"
+        await update.message.reply_text("Send chat id or username")
+        return
+
+    if msg == "➖ Remove Chat":
+        user["state"] = "remove_chat"
+        await update.message.reply_text("Send chat id to remove")
+        return
+
+    if msg == "📋 List Chats":
+        await update.message.reply_text(str(user["chats"]))
+        return
+
+    if user["state"] == "add_chat":
+        user["chats"].append(msg)
+        user["state"] = None
+        save_data(db)
+        await update.message.reply_text("Chat added")
+        return
+
+    if user["state"] == "remove_chat":
+        if msg in user["chats"]:
+            user["chats"].remove(msg)
+        user["state"] = None
+        save_data(db)
+        await update.message.reply_text("Chat removed")
+        return
+
+    # =========================
+    # INTERVAL
+    # =========================
+
+    if msg == "⏱ Interval":
+        user["state"] = "interval"
+        await update.message.reply_text("Send seconds")
+        return
+
+    if user["state"] == "interval":
+        user["interval"] = int(msg)
+        user["state"] = None
+        save_data(db)
+        await update.message.reply_text("Interval updated")
+        return
+
+    # =========================
+    # ADS
+    # =========================
+
+    if msg == "▶ Start Ads":
+        if not user["chats"]:
+            await update.message.reply_text("Add chats first")
+            return
+
+        user["running"] = True
+        save_data(db)
+
+        context.application.create_task(ads_loop(uid))
+
+        await update.message.reply_text("Ads started")
+        return
+
+    if msg == "⏹ Stop Ads":
+        user["running"] = False
+        save_data(db)
+        await update.message.reply_text("Ads stopped")
+        return
+
+    # =========================
+    # STATUS
+    # =========================
+
+    if msg == "📊 Status":
+        await update.message.reply_text(
+            f"Chats: {len(user['chats'])}\n"
+            f"Interval: {user['interval']}s\n"
+            f"Running: {user['running']}\n"
+            f"Message:\n{user['message']}"
+        )
 
 
-async def stop_ads(uid, message):
-    if uid in tasks:
-        tasks[uid].cancel()
-        del tasks[uid]
-        await message.reply_text("Ads stopped")
+# =================================
+# MAIN
+# =================================
 
-
-# =========================
-# MAIN (NO LOOP CRASH)
-# =========================
-if __name__ == "__main__":
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.TEXT, text))
 
-    print("AdBot PRO running...")
+    print("🚀 AdBot PRO++ running")
+
     app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
