@@ -1,303 +1,217 @@
 import os
-import json
 import asyncio
-from telegram import ReplyKeyboardMarkup, Update
+import json
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telethon import TelegramClient
 
-# =================================
+# =============================
 # ENV
-# =================================
+# =============================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
-# =================================
-# FILES
-# =================================
+# =============================
+# DATA
+# =============================
 
 DATA_FILE = "data.json"
-SESSIONS_DIR = "sessions"
-os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 
-# =================================
-# DATABASE
-# =================================
-
-def load_data():
+def load():
     if not os.path.exists(DATA_FILE):
-        return {}
+        return {"chats": [], "message": "", "interval": 60}
     return json.load(open(DATA_FILE))
 
 
-def save_data(d):
-    json.dump(d, open(DATA_FILE, "w"), indent=2)
+def save(data):
+    json.dump(data, open(DATA_FILE, "w"), indent=2)
 
 
-db = load_data()
+data = load()
+
+# =============================
+# TELETHON
+# =============================
+
+client = TelegramClient("session", API_ID, API_HASH)
+
+phone_cache = {}
+
+# =============================
+# UI
+# =============================
 
 
-# =================================
-# KEYBOARD
-# =================================
-
-def keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["📱 Login", "🚪 Logout"],
-            ["➕ Add Chat", "➖ Remove Chat"],
-            ["📋 List Chats"],
-            ["📝 Set Message"],
-            ["▶ Start Ads", "⏹ Stop Ads"],
-            ["⏱ Interval", "📊 Status"],
-        ],
-        resize_keyboard=True,
-    )
+def menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Login", callback_data="login")],
+        [InlineKeyboardButton("➕ Add Chat", callback_data="add"),
+         InlineKeyboardButton("➖ Remove Chat", callback_data="remove")],
+        [InlineKeyboardButton("📝 Set Message", callback_data="msg")],
+        [InlineKeyboardButton("⏱ Set Interval", callback_data="interval")],
+        [InlineKeyboardButton("▶ Start Ads", callback_data="start"),
+         InlineKeyboardButton("⏹ Stop Ads", callback_data="stop")],
+    ])
 
 
-# =================================
-# HELPERS
-# =================================
-
-def get_user(uid):
-    uid = str(uid)
-
-    if uid not in db:
-        db[uid] = {
-            "chats": [],
-            "interval": 60,
-            "message": "🔥 Default Ad Message 🔥",
-            "running": False,
-            "state": None,
-            "phone": None,
-        }
-
-    return db[uid]
-
-
-async def get_client(uid):
-    return TelegramClient(f"{SESSIONS_DIR}/{uid}", API_ID, API_HASH)
-
-
-# =================================
-# ADS LOOP
-# =================================
-
-async def ads_loop(uid):
-    user = get_user(uid)
-    client = await get_client(uid)
-
-    await client.connect()
-
-    while user["running"]:
-        try:
-            for chat in user["chats"]:
-                await client.send_message(chat, user["message"])
-
-            await asyncio.sleep(user["interval"])
-
-        except:
-            await asyncio.sleep(5)
-
-    await client.disconnect()
-
-
-# =================================
+# =============================
 # START
-# =================================
+# =============================
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
     await update.message.reply_text(
-        "🚀 AdBot PRO++ Ready",
-        reply_markup=keyboard(),
+        "🚀 **Optima Agency Ads Panel**\n\nPremium Telegram Automation",
+        reply_markup=menu(),
+        parse_mode="Markdown"
     )
 
 
-# =================================
-# MAIN TEXT HANDLER
-# =================================
+# =============================
+# BUTTON HANDLER
+# =============================
+
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    action = q.data
+
+    if action == "login":
+        context.user_data["state"] = "phone"
+        await q.message.reply_text("📱 Send your mobile number with country code\nExample: +919876543210")
+
+    elif action == "add":
+        context.user_data["state"] = "add"
+        await q.message.reply_text("Send chat ID or @username")
+
+    elif action == "remove":
+        context.user_data["state"] = "remove"
+        await q.message.reply_text("Send chat to remove")
+
+    elif action == "msg":
+        context.user_data["state"] = "msg"
+        await q.message.reply_text("Send your ad message")
+
+    elif action == "interval":
+        context.user_data["state"] = "interval"
+        await q.message.reply_text("Send interval in seconds")
+
+    elif action == "start":
+        context.application.create_task(ad_loop(context))
+        await q.message.reply_text("▶ Ads started")
+
+    elif action == "stop":
+        context.application.stop_ads = True
+        await q.message.reply_text("⏹ Ads stopped")
+
+
+# =============================
+# TEXT INPUT
+# =============================
+
 
 async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text.strip()
-    uid = update.message.from_user.id
-    user = get_user(uid)
+    if update.effective_user.id not in ADMIN_IDS:
+        return
 
-    # =========================
+    state = context.user_data.get("state")
+    msg = update.message.text
+
     # LOGIN FLOW
-    # =========================
-
-    if msg == "📱 Login":
-        user["state"] = "phone"
-        save_data(db)
-        await update.message.reply_text("Send phone number (+91xxxx)")
-        return
-
-    if user["state"] == "phone":
-        user["phone"] = msg
-
-        client = await get_client(uid)
+    if state == "phone":
         await client.connect()
+        phone_cache["phone"] = msg
         await client.send_code_request(msg)
+        context.user_data["state"] = "otp"
+        await update.message.reply_text("Enter OTP like code12345")
 
-        user["state"] = "otp"
-        save_data(db)
+    elif state == "otp":
+        code = msg.replace("code", "")
+        await client.sign_in(phone_cache["phone"], code)
+        await update.message.reply_text("✅ Logged in successfully")
+        context.user_data["state"] = None
 
-        await update.message.reply_text(
-            "Send OTP like:\ncode12345"
-        )
-        return
-
-    # ===== OTP FORMAT FIXED HERE =====
-
-    if user["state"] == "otp":
-        if not msg.startswith("code"):
-            await update.message.reply_text("Format must be: code12345")
-            return
-
-        code = msg[4:]
-
-        client = await get_client(uid)
-        await client.sign_in(user["phone"], code)
-
-        user["state"] = None
-        save_data(db)
-
-        await update.message.reply_text("✅ Login successful")
-        return
-
-    # =========================
-    # LOGOUT
-    # =========================
-
-    if msg == "🚪 Logout":
-        session = f"{SESSIONS_DIR}/{uid}.session"
-        if os.path.exists(session):
-            os.remove(session)
-
-        await update.message.reply_text("Logged out")
-        return
-
-    # =========================
-    # SET MESSAGE (NEW FEATURE)
-    # =========================
-
-    if msg == "📝 Set Message":
-        user["state"] = "set_message"
-        await update.message.reply_text("Send your ad message text")
-        return
-
-    if user["state"] == "set_message":
-        user["message"] = msg
-        user["state"] = None
-        save_data(db)
-        await update.message.reply_text("✅ Message updated")
-        return
-
-    # =========================
-    # CHAT MANAGEMENT
-    # =========================
-
-    if msg == "➕ Add Chat":
-        user["state"] = "add_chat"
-        await update.message.reply_text("Send chat id or username")
-        return
-
-    if msg == "➖ Remove Chat":
-        user["state"] = "remove_chat"
-        await update.message.reply_text("Send chat id to remove")
-        return
-
-    if msg == "📋 List Chats":
-        await update.message.reply_text(str(user["chats"]))
-        return
-
-    if user["state"] == "add_chat":
-        user["chats"].append(msg)
-        user["state"] = None
-        save_data(db)
+    # ADD CHAT
+    elif state == "add":
+        data["chats"].append(msg)
+        save(data)
         await update.message.reply_text("Chat added")
-        return
+        context.user_data["state"] = None
 
-    if user["state"] == "remove_chat":
-        if msg in user["chats"]:
-            user["chats"].remove(msg)
-        user["state"] = None
-        save_data(db)
+    # REMOVE CHAT
+    elif state == "remove":
+        if msg in data["chats"]:
+            data["chats"].remove(msg)
+            save(data)
         await update.message.reply_text("Chat removed")
-        return
+        context.user_data["state"] = None
 
-    # =========================
+    # MESSAGE
+    elif state == "msg":
+        data["message"] = msg
+        save(data)
+        await update.message.reply_text("Message saved")
+        context.user_data["state"] = None
+
     # INTERVAL
-    # =========================
-
-    if msg == "⏱ Interval":
-        user["state"] = "interval"
-        await update.message.reply_text("Send seconds")
-        return
-
-    if user["state"] == "interval":
-        user["interval"] = int(msg)
-        user["state"] = None
-        save_data(db)
+    elif state == "interval":
+        data["interval"] = int(msg)
+        save(data)
         await update.message.reply_text("Interval updated")
-        return
-
-    # =========================
-    # ADS
-    # =========================
-
-    if msg == "▶ Start Ads":
-        if not user["chats"]:
-            await update.message.reply_text("Add chats first")
-            return
-
-        user["running"] = True
-        save_data(db)
-
-        context.application.create_task(ads_loop(uid))
-
-        await update.message.reply_text("Ads started")
-        return
-
-    if msg == "⏹ Stop Ads":
-        user["running"] = False
-        save_data(db)
-        await update.message.reply_text("Ads stopped")
-        return
-
-    # =========================
-    # STATUS
-    # =========================
-
-    if msg == "📊 Status":
-        await update.message.reply_text(
-            f"Chats: {len(user['chats'])}\n"
-            f"Interval: {user['interval']}s\n"
-            f"Running: {user['running']}\n"
-            f"Message:\n{user['message']}"
-        )
+        context.user_data["state"] = None
 
 
-# =================================
+# =============================
+# AD LOOP
+# =============================
+
+
+async def ad_loop(context):
+    context.application.stop_ads = False
+
+    while not context.application.stop_ads:
+        for chat in data["chats"]:
+            try:
+                await context.bot.send_message(chat, data["message"])
+            except:
+                pass
+
+        await asyncio.sleep(data["interval"])
+
+
+# =============================
 # MAIN
-# =================================
+# =============================
+
 
 def main():
+    print("🚀 Optima Agency Bot running...")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT, text))
-
-    print("🚀 AdBot PRO++ running")
+    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
 
     app.run_polling()
 
