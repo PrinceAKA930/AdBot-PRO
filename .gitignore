@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# telethon sessions
+sessions/
+
+# database
+data.db
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+*.log
